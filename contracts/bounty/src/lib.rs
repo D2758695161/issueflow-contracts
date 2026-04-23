@@ -12,6 +12,8 @@ pub struct Bounty {
     pub token: Address,
     pub is_claimed: bool,
     pub is_cancelled: bool,
+    pub deadline: u64,          // Issue #7: Unix timestamp deadline, 0 = no deadline
+    pub approved_claimant: Option<Address>, // Issue #6: Only this address can claim (after maintainer approval)
 }
 
 const BOUNTIES: Symbol = symbol_short!("BOUNTIES");
@@ -27,6 +29,7 @@ impl BountyContract {
         maintainer: Address,
         amount: i128,
         token: Address,
+        deadline: u64, // Issue #7: Unix timestamp. Auto-cancels if not claimed by this time.
     ) -> u32 {
         maintainer.require_auth();
         
@@ -40,6 +43,8 @@ impl BountyContract {
             token: token.clone(),
             is_claimed: false,
             is_cancelled: false,
+            deadline,
+            approved_claimant: None,
         };
         
         let mut bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
@@ -57,40 +62,100 @@ impl BountyContract {
         id
     }
     
-    pub fn claim_bounty(
+    // Issue #6: Maintainer approves a specific claimant before they can claim
+    pub fn approve_claimant(
         env: Env,
         bounty_id: u32,
         claimant: Address,
     ) {
-        claimant.require_auth();
-        
         let mut bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
-        
+
         for i in 0..bounties.len() {
             let mut bounty = bounties.get(i).unwrap();
             if bounty.id == bounty_id {
+                bounty.maintainer.require_auth();
+
                 if bounty.is_claimed {
                     panic!("Bounty already claimed");
                 }
                 if bounty.is_cancelled {
                     panic!("Bounty is cancelled");
                 }
-                
+                if bounty.deadline > 0 && env.ledger().timestamp() > bounty.deadline {
+                    panic!("Bounty deadline has passed");
+                }
+
+                bounty.approved_claimant = Some(claimant);
+                bounties.set(i, bounty.clone());
+                env.storage().instance().set(&BOUNTIES, &bounties);
+                return;
+            }
+        }
+
+        panic!("Bounty not found");
+    }
+
+    pub fn claim_bounty(
+        env: Env,
+        bounty_id: u32,
+        claimant: Address,
+    ) {
+        claimant.require_auth();
+
+        // Issue #7: Check deadline before processing
+        let mut bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
+
+        for i in 0..bounties.len() {
+            let mut bounty = bounties.get(i).unwrap();
+            if bounty.id == bounty_id {
+                // Issue #7: Auto-cancel if deadline passed
+                if bounty.deadline > 0 && env.ledger().timestamp() > bounty.deadline {
+                    if !bounty.is_claimed && !bounty.is_cancelled {
+                        bounty.is_cancelled = true;
+                        bounties.set(i, bounty.clone());
+                        env.storage().instance().set(&BOUNTIES, &bounties);
+
+                        // Return tokens to maintainer
+                        env.invoke_contract::<()>(
+                            &bounty.token,
+                            &symbol_short!("transfer"),
+                            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), bounty.maintainer.into_val(&env), bounty.amount.into_val(&env)],
+                        );
+                    }
+                    panic!("Bounty deadline has passed and bounty is auto-cancelled");
+                }
+
+                if bounty.is_claimed {
+                    panic!("Bounty already claimed");
+                }
+                if bounty.is_cancelled {
+                    panic!("Bounty is cancelled");
+                }
+
+                // Issue #6: Only approved claimant can claim
+                if let Some(ref approved) = bounty.approved_claimant {
+                    if approved != &claimant {
+                        panic!("Claimant not approved by maintainer");
+                    }
+                } else {
+                    panic!("Claimant not approved by maintainer");
+                }
+
                 bounty.is_claimed = true;
                 bounties.set(i, bounty.clone());
                 env.storage().instance().set(&BOUNTIES, &bounties);
-                
+
                 // Transfer tokens to claimant
                 env.invoke_contract::<()>(
                     &bounty.token,
                     &symbol_short!("transfer"),
-                    soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), claimant.into_val(&env), bounty.amount.into_val(&env)]
+                    soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), claimant.into_val(&env), bounty.amount.into_val(&env)],
                 );
-                
+
                 return;
             }
         }
-        
+
         panic!("Bounty not found");
     }
     
@@ -99,57 +164,76 @@ impl BountyContract {
         bounty_id: u32,
     ) {
         let mut bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
-        
+
         for i in 0..bounties.len() {
             let mut bounty = bounties.get(i).unwrap();
             if bounty.id == bounty_id {
                 bounty.maintainer.require_auth();
-                
+
                 if bounty.is_claimed {
                     panic!("Cannot cancel claimed bounty");
                 }
                 if bounty.is_cancelled {
                     panic!("Bounty already cancelled");
                 }
-                
+
                 bounty.is_cancelled = true;
                 bounties.set(i, bounty.clone());
                 env.storage().instance().set(&BOUNTIES, &bounties);
-                
+
                 // Return tokens to maintainer
                 env.invoke_contract::<()>(
                     &bounty.token,
                     &symbol_short!("transfer"),
-                    soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), bounty.maintainer.into_val(&env), bounty.amount.into_val(&env)]
+                    soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), bounty.maintainer.into_val(&env), bounty.amount.into_val(&env)],
                 );
-                
+
                 return;
             }
         }
-        
+
         panic!("Bounty not found");
     }
     
     pub fn get_bounty(env: Env, bounty_id: u32) -> Bounty {
         let bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
-        
+
         for i in 0..bounties.len() {
             let bounty = bounties.get(i).unwrap();
             if bounty.id == bounty_id {
                 return bounty;
             }
         }
-        
+
         panic!("Bounty not found");
     }
-    
+
     pub fn get_all_bounties(env: Env) -> Vec<Bounty> {
         env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env))
     }
 
-    pub fn cancel_bounty(env: Env, token: Address, maintainer: Address, amount: i128) {
-        maintainer.require_auth();
-        let client = token::Client::new(&env, &token);
-        client.transfer(&env.current_contract_address(), &maintainer, &amount);
+    // Issue #7: Check and auto-cancel expired bounties (call this on chain to trigger)
+    pub fn check_deadlines(env: Env) {
+        let mut bounties: Vec<Bounty> = env.storage().instance().get(&BOUNTIES).unwrap_or(Vec::new(&env));
+        let current_time = env.ledger().timestamp();
+
+        for i in 0..bounties.len() {
+            let mut bounty = bounties.get(i).unwrap();
+            if bounty.deadline > 0 && current_time > bounty.deadline {
+                if !bounty.is_claimed && !bounty.is_cancelled {
+                    bounty.is_cancelled = true;
+                    bounties.set(i, bounty.clone());
+
+                    // Return tokens to maintainer
+                    env.invoke_contract::<()>(
+                        &bounty.token,
+                        &symbol_short!("transfer"),
+                        soroban_sdk::vec![&env, env.current_contract_address().into_val(&env), bounty.maintainer.into_val(&env), bounty.amount.into_val(&env)],
+                    );
+                }
+            }
+        }
+
+        env.storage().instance().set(&BOUNTIES, &bounties);
     }
 }
